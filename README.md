@@ -84,3 +84,25 @@ python train_vq_vae.py --model_type VQ-VAE-small --device cuda:0 --data cross_GB
 ```
 python testing.py --model vqvae --name rot_flip
 ```
+
+## Padding evaluation on Pascal
+
+The padding batch uses `touch2touch-smoke` for Diffusion inference and
+`touch2touch-icp-clean` for scoring. FID requires `pytorch-fid==0.3.0` in the
+scoring environment too. Use the same version pinned in `ldm.yml`. Install it
+once in the existing evaluation environment with `--no-deps` to keep its
+PyTorch and other dependencies in place.
+
+```bash
+module load conda
+conda run -n touch2touch-icp-clean python -m pip install --no-cache-dir --no-deps 'pytorch-fid==0.3.0'
+```
+
+From the repository root, run the CPU preflight before requesting a GPU.
+It checks the 138 unseen-tool pairs and loads the FID model in the scoring environment.
+
+```bash
+conda run --no-capture-output -n touch2touch-icp-clean \
+  python -B -m scripts.compare_icp --dataset padding --preflight-only \
+  --image-metrics --examples-per-tool 1
+```
