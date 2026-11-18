@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.nn.functional import interpolate
+from torch.nn.functional import interpolate, pad
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -32,6 +32,7 @@ VQ_WEIGHTS = (
 )
 SEED = 42
 PEAK_DEPTH = 0.0225
+GELSLIM_PADDING_SCALE = 4
 
 
 def time_seconds(value):
@@ -88,7 +89,24 @@ def save_json(path, data):
         partial.unlink(missing_ok=True)
 
 
-def run_diffusion(samples, data, output, args, inference_deadline):
+def configure_diffusion_imports():
+    # The scripts directory contains local wandb logs that can shadow the
+    # optional wandb package when a script is run by filename.
+    scripts_directory = Path(__file__).resolve().parent
+    sys.path[:] = [str(REPO), str(DIFFUSION)] + [
+        entry for entry in sys.path if Path(entry).resolve() != scripts_directory
+    ]
+
+
+def pad_gelslim(image):
+    """Center the GelSlim signal in a zero-valued canvas with 16 times the area."""
+    height, width = image.shape[-2:]
+    extra_h = height * (GELSLIM_PADDING_SCALE - 1)
+    extra_w = width * (GELSLIM_PADDING_SCALE - 1)
+    return pad(image, (extra_w // 2, extra_w - extra_w // 2, extra_h // 2, extra_h - extra_h // 2))
+
+
+def run_diffusion(samples, gelslim_files, output, args, inference_deadline, *, padded=False):
     from pytorch_lightning import seed_everything
     from omegaconf import OmegaConf
     from touch2touch.stable_diffusion.ldm.models.diffusion.ddim import DDIMSampler
@@ -96,6 +114,12 @@ def run_diffusion(samples, data, output, args, inference_deadline):
     from touch2touch.stable_diffusion.scripts.tactile_style_transfer_estimator import TouchEstimator
 
     class CheckedEstimator(TouchEstimator):
+        def init_preprocessing(self):
+            super().init_preprocessing()
+            if padded:
+                # The estimator subtracts the reference image before this transform.
+                self.gelslim_transform.transforms.insert(0, pad_gelslim)
+
         def load_model(self):
             config = OmegaConf.load(self.opt.config)
             checkpoint = load(self.opt.ckpt)
@@ -140,7 +164,7 @@ def run_diffusion(samples, data, output, args, inference_deadline):
             inputs = directory / "gelslims"
             inputs.mkdir()
             for _, name in batch:
-                (inputs / name).symlink_to(data / "gelslims" / name)
+                (inputs / name).symlink_to(gelslim_files[name])
             estimator.opt.outdir = str(directory / "previews")
             try:
                 for finger in range(len(FINGERS)):
@@ -445,12 +469,7 @@ def main():
     output = args.output.resolve() if args.output is not None else None
     if args.predictions:
         args.predictions = args.predictions.resolve()
-    # Direct script execution adds scripts/ to sys.path. Its wandb/ log
-    # directory can masquerade as an installed optional wandb package.
-    scripts_directory = Path(__file__).resolve().parent
-    sys.path[:] = [str(REPO), str(DIFFUSION)] + [
-        entry for entry in sys.path if Path(entry).resolve() != scripts_directory
-    ]
+    configure_diffusion_imports()
     preflight(samples, args)
     if args.preflight_only:
         return
@@ -485,7 +504,8 @@ def main():
     if args.predictions:
         completed = existing_predictions(samples, args.predictions, args.data.name)
     else:
-        completed, inference_error = run_diffusion(samples, args.data, output, args,
+        gelslim_files = {name: args.data / "gelslims" / name for _, name in samples}
+        completed, inference_error = run_diffusion(samples, gelslim_files, output, args,
                                                    started + available - args.reserve_minutes * 60)
     if not completed:
         raise RuntimeError("No completed pairs before the evaluation reserve")
